@@ -188,10 +188,14 @@ impl<P: PacketPool> TxPacket<P> {
 struct Inner {
     /// Random generator
     rng: ChaCha12Rng,
-    /// Persistent LESC keypair (generated once when RNG is seeded)
-    secret_key: crypto::SecretKey,
-    /// Corresponding public key
-    public_key: crypto::PublicKey,
+    /// Persistent LESC keypair: generated once, when the RNG is seeded
+    /// (`set_random_generator_seed`), or from the current RNG on first use
+    /// if pairing ever starts before that. Not generated in `new`: the P-256
+    /// public key is a scalar multiplication (tens of ms on a small MCU), and
+    /// the control runner reseeds and replaces it before any connection
+    /// exists, so a keypair made at construction was computed only to be
+    /// thrown away.
+    keypair: Option<(crypto::SecretKey, crypto::PublicKey)>,
     /// Security manager data
     state: SecurityManagerData,
     /// State of an ongoing pairing
@@ -211,6 +215,24 @@ struct SmpCommand<'a> {
     payload: &'a [u8],
     handle: ConnHandle,
     peer_identity: Identity,
+}
+
+/// Generates a LESC keypair from `rng`.
+fn generate_keypair(rng: &mut ChaCha12Rng) -> (crypto::SecretKey, crypto::PublicKey) {
+    let secret_key = crypto::SecretKey::new(rng);
+    let public_key = secret_key.public_key();
+    (secret_key, public_key)
+}
+
+/// The persistent keypair, generated from `rng` if there is none yet. A free
+/// function over the two fields so the returned borrow covers `keypair` only
+/// and the caller can still use the other fields of `Inner`.
+fn keypair<'k>(
+    keypair: &'k mut Option<(crypto::SecretKey, crypto::PublicKey)>,
+    rng: &mut ChaCha12Rng,
+) -> (&'k crypto::SecretKey, &'k crypto::PublicKey) {
+    let (secret_key, public_key) = keypair.get_or_insert_with(|| generate_keypair(rng));
+    (secret_key, public_key)
 }
 
 impl Inner {
@@ -327,11 +349,12 @@ impl Inner {
             return Err(Error::InvalidState);
         }
 
+        let (secret_key, public_key) = keypair(&mut self.keypair, &mut self.rng);
         let mut ops = PairingOpsImpl {
             bonds,
             events,
-            secret_key: &self.secret_key,
-            public_key: &self.public_key,
+            secret_key,
+            public_key,
             conn_handle: handle,
             connections,
             storage,
@@ -394,11 +417,12 @@ impl Inner {
             return Err(Error::InvalidState);
         }
 
+        let (secret_key, public_key) = keypair(&mut self.keypair, &mut self.rng);
         let mut ops = PairingOpsImpl {
             bonds,
             events,
-            secret_key: &self.secret_key,
-            public_key: &self.public_key,
+            secret_key,
+            public_key,
             conn_handle: handle,
             connections,
             storage,
@@ -417,11 +441,12 @@ impl Inner {
         storage: &ConnectionStorage<P::Packet>,
     ) -> Result<(), Error> {
         if let Some(sm) = Self::pairing_sm_for(self.pairing_sm.as_mut(), storage) {
+            let (secret_key, public_key) = keypair(&mut self.keypair, &mut self.rng);
             let mut ops = PairingOpsImpl {
                 bonds,
                 events,
-                secret_key: &self.secret_key,
-                public_key: &self.public_key,
+                secret_key,
+                public_key,
                 peer_identity: storage.peer_identity,
                 conn_handle: storage.handle,
                 connections,
@@ -449,11 +474,12 @@ impl Inner {
     ) -> Result<(), Error> {
         let mut bond = None;
         let res: Result<(), Error> = if let Some(sm) = Self::pairing_sm_for(self.pairing_sm.as_mut(), storage) {
+            let (secret_key, public_key) = keypair(&mut self.keypair, &mut self.rng);
             let mut ops = PairingOpsImpl {
                 bonds,
                 events,
-                secret_key: &self.secret_key,
-                public_key: &self.public_key,
+                secret_key,
+                public_key,
                 peer_identity: storage.peer_identity,
                 connections,
                 storage,
@@ -529,13 +555,14 @@ impl Inner {
             if sm.is_waiting_bonded_encryption() {
                 storage.bond_rejected = true;
             }
+            let (secret_key, public_key) = keypair(&mut self.keypair, &mut self.rng);
             let _res = sm.handle_event(
                 pairing::Event::LinkEncryptedResult(false),
                 &mut PairingOpsImpl {
                     bonds,
                     events,
-                    secret_key: &self.secret_key,
-                    public_key: &self.public_key,
+                    secret_key,
+                    public_key,
                     peer_identity: storage.peer_identity,
                     connections,
                     storage,
@@ -578,11 +605,12 @@ impl Inner {
         let local_address = self.connection_local_address(storage)?;
         let peer_address = Self::connection_peer_address(storage);
         let local_io = self.io_capabilities;
+        let (secret_key, public_key) = keypair(&mut self.keypair, &mut self.rng);
         let mut ops = PairingOpsImpl {
             bonds,
             events,
-            secret_key: &self.secret_key,
-            public_key: &self.public_key,
+            secret_key,
+            public_key,
             conn_handle: handle,
             connections,
             storage,
@@ -623,14 +651,11 @@ pub struct SecurityManager<'d> {
 impl<'d> SecurityManager<'d> {
     /// Create a new SecurityManager
     pub(crate) fn new(bonds: &'d RefCell<VecView<BondInformation>>) -> Self {
-        let mut rng = ChaCha12Rng::from_seed([0u8; 32]);
-        let secret_key = crypto::SecretKey::new(&mut rng);
-        let public_key = secret_key.public_key();
+        let rng = ChaCha12Rng::from_seed([0u8; 32]);
         Self {
             inner: RefCell::new(Inner {
                 rng,
-                secret_key,
-                public_key,
+                keypair: None,
                 state: SecurityManagerData::new(),
                 pairing_sm: None,
                 finished_waker: WakerRegistration::new(),
@@ -659,8 +684,8 @@ impl<'d> SecurityManager<'d> {
     pub(crate) fn set_random_generator_seed(&self, random_seed: [u8; 32]) {
         let mut inner = self.inner.borrow_mut();
         inner.rng = ChaCha12Rng::from_seed(random_seed);
-        inner.secret_key = crypto::SecretKey::new(&mut inner.rng);
-        inner.public_key = inner.secret_key.public_key();
+        let keypair = generate_keypair(&mut inner.rng);
+        inner.keypair = Some(keypair);
     }
 
     /// Set the current local address
@@ -728,8 +753,10 @@ impl<'d> SecurityManager<'d> {
     /// that will be sent during pairing.
     pub(crate) fn get_local_oob_data(&self) -> pairing::OobData {
         let mut inner = self.inner.borrow_mut();
+        let inner = &mut *inner;
+        let (_, public_key) = keypair(&mut inner.keypair, &mut inner.rng);
         let r = crypto::Nonce::new(&mut inner.rng);
-        let c = r.f4(inner.public_key.x(), inner.public_key.x(), 0);
+        let c = r.f4(public_key.x(), public_key.x(), 0);
         pairing::OobData {
             random: r.0.to_le_bytes(),
             confirm: c.0.to_le_bytes(),
@@ -1308,12 +1335,10 @@ mod tests {
 
     fn test_inner(peer_address: Address) -> Inner {
         let mut rng = ChaCha12Rng::from_seed([7; 32]);
-        let secret_key = crypto::SecretKey::new(&mut rng);
-        let public_key = secret_key.public_key();
+        let keypair = generate_keypair(&mut rng);
         Inner {
             rng,
-            secret_key,
-            public_key,
+            keypair: Some(keypair),
             state: SecurityManagerData {
                 local_address: Some(Address::random([1, 2, 3, 4, 5, 6])),
                 local_irk: None,
