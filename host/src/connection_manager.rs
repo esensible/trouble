@@ -594,6 +594,14 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
                 }
                 #[cfg(feature = "security")]
                 {
+                    // A plain (non-enhanced) connection event carries only the on-air
+                    // peer address. When that resolved to a bond with a different
+                    // identity address, keep the on-air address: pairing's f5/f6
+                    // (DHKey check) must use the addresses the peer actually used.
+                    let mut resolvable_addrs = resolvable_addrs;
+                    if resolvable_addrs.peer.is_none() && storage.peer_identity.addr != peer_addr {
+                        resolvable_addrs.peer = Some(peer_addr.addr);
+                    }
                     storage.resolvable_addrs = resolvable_addrs;
                 }
 
