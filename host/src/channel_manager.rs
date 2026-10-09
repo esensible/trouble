@@ -32,7 +32,6 @@ const L2CAP_RTX_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_s
 
 struct State {
     next_req_id: u8,
-    accept_waker: WakerRegistration,
     create_waker: WakerRegistration,
     disconnect_waker: WakerRegistration,
     /// Bitmask tracking which SPSMs (0x0001..=0x00FF) have active listeners.
@@ -116,7 +115,6 @@ impl<'d, P: PacketPool> ChannelManager<'d, P> {
         Self {
             state: RefCell::new(State {
                 next_req_id: 0,
-                accept_waker: WakerRegistration::new(),
                 create_waker: WakerRegistration::new(),
                 disconnect_waker: WakerRegistration::new(),
                 registered_spsms: [0; 8],
@@ -215,9 +213,8 @@ impl<'d, P: PacketPool> ChannelManager<'d, P> {
                 storage.close();
             }
         }
-        let mut state = self.state.borrow_mut();
-        state.accept_waker.wake();
-        state.create_waker.wake();
+        // A listener on `conn` is woken by the connection manager, which owns its waker.
+        self.state.borrow_mut().create_waker.wake();
         Ok(())
     }
 
@@ -265,9 +262,11 @@ impl<'d, P: PacketPool> ChannelManager<'d, P> {
         connections: &ConnectionManager<'_, P>,
     ) -> Result<L2capPendingConnection<'d, P>, Error> {
         poll_fn(|cx| {
-            let mut state = self.state.borrow_mut();
-            state.accept_waker.register(cx.waker());
-            core::mem::drop(state);
+            // Each connection has its own waker: with listeners on several connections, a
+            // request on one must wake that one's listener, not whichever polled last.
+            if !connections.register_l2cap_accept_waker(conn, cx.waker()) {
+                return Poll::Ready(Err(Error::Disconnected));
+            }
 
             let mut channels = self.channels.borrow_mut();
             for (idx, chan) in channels.iter_mut().enumerate() {
@@ -753,7 +752,7 @@ impl<'d, P: PacketPool> ChannelManager<'d, P> {
         manager: &ConnectionManager<'_, P>,
     ) -> Result<(), Error> {
         let result = {
-            let mut state = self.state.borrow_mut();
+            let state = self.state.borrow();
             if !state.is_spsm_registered(req.spsm) {
                 Err(LeCreditConnResultCode::SpsmNotSupported)
             } else if !manager.is_l2cap_listening(conn) {
@@ -768,7 +767,7 @@ impl<'d, P: PacketPool> ChannelManager<'d, P> {
                     storage.state = ChannelState::PeerConnecting(identifier);
                 }) {
                     Ok(_) => {
-                        state.accept_waker.wake();
+                        manager.wake_l2cap_accept(conn);
                         Ok(())
                     }
                     Err(Error::L2capConnectError(result)) => Err(result),
@@ -1633,6 +1632,8 @@ impl<P> Drop for CreditGrant<'_, P> {
 mod tests {
     extern crate std;
 
+    use core::future::Future;
+
     use bt_hci::param::{AddrKind, BdAddr, LeConnRole, Status};
 
     use super::*;
@@ -1678,5 +1679,105 @@ mod tests {
             chan,
             Poll::Ready(Err(BleHostError::BleHost(Error::Disconnected)))
         ));
+    }
+
+    /// A waker that counts how often it was woken.
+    struct CountingWaker(std::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for CountingWaker {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn counting_waker() -> (std::sync::Arc<CountingWaker>, core::task::Waker) {
+        let counter = std::sync::Arc::new(CountingWaker(std::sync::atomic::AtomicUsize::new(0)));
+        (counter.clone(), core::task::Waker::from(counter))
+    }
+
+    fn woken(counter: &CountingWaker) -> usize {
+        counter.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// With listeners on two connections, a connection request on one wakes that one's
+    /// listener, whichever polled last; and a disconnect wakes the listener of the connection
+    /// that went away. (With one waker for every listener, the request on the first connection
+    /// woke only the second's listener and the first never saw it.)
+    #[test]
+    fn each_listener_is_woken_for_its_own_connection() {
+        let mut resources: HostResources<DefaultPacketPool, 2, 4> = HostResources::new();
+        let ble = MockController::new();
+        let builder = crate::new(ble, &mut resources);
+        let ble = BleHost::new(
+            builder.controller.as_ref().unwrap(),
+            builder.host_state.as_ref().unwrap(),
+        );
+        const SPSM: u16 = 0x0080;
+        ble.channels().register_spsm(SPSM);
+
+        // two peripheral connections, each accepted as the stack accepts them
+        let (a, b) = (ConnHandle::new(1), ConnHandle::new(2));
+        let accept = |handle: ConnHandle, last: u8| {
+            assert!(ble
+                .connections()
+                .poll_accept(LeConnRole::Peripheral, &[], None)
+                .is_pending());
+            ble.connections()
+                .connect(
+                    handle,
+                    Address::new(AddrKind::RANDOM, BdAddr::new([last, 0, 0, 0, 0, 0xc0])),
+                    LeConnRole::Peripheral,
+                    ConnParams::new(),
+                )
+                .unwrap();
+            match ble.connections().poll_accept(LeConnRole::Peripheral, &[], None) {
+                Poll::Ready(conn) => conn,
+                Poll::Pending => panic!("connection {handle:?} not accepted"),
+            }
+        };
+        let conn_a = accept(a, 1);
+        let conn_b = accept(b, 2);
+        // what `L2capChannel::listen` does
+        conn_a.set_l2cap_listening(true);
+        conn_b.set_l2cap_listening(true);
+
+        let (count_a, waker_a) = counting_waker();
+        let (count_b, waker_b) = counting_waker();
+        let mut listen_a = core::pin::pin!(ble.channels().next_pending(a, ble.connections()));
+        let mut listen_b = core::pin::pin!(ble.channels().next_pending(b, ble.connections()));
+        // A polls first, B last
+        assert!(listen_a.as_mut().poll(&mut Context::from_waker(&waker_a)).is_pending());
+        assert!(listen_b.as_mut().poll(&mut Context::from_waker(&waker_b)).is_pending());
+
+        // a request on A wakes A's listener, not B's
+        let request = LeCreditConnReq {
+            spsm: SPSM,
+            scid: 0x0040,
+            mtu: 247,
+            mps: 247,
+            credits: 4,
+        };
+        ble.channels()
+            .handle_connect_request(a, 7, &request, ble.connections())
+            .unwrap();
+        assert_eq!((woken(&count_a), woken(&count_b)), (1, 0));
+        let pending = match listen_a.as_mut().poll(&mut Context::from_waker(&waker_a)) {
+            Poll::Ready(Ok(pending)) => pending,
+            _ => panic!("A's listener did not get its request"),
+        };
+        assert_eq!(pending.spsm(), SPSM);
+        // B's listener has nothing to see
+        assert!(listen_b.as_mut().poll(&mut Context::from_waker(&waker_b)).is_pending());
+        ble.channels().drop_pending(pending.into_index());
+
+        // B goes away: its listener is woken and told so; A's is not woken
+        ble.connections().disconnected(b, Status::UNSPECIFIED).unwrap();
+        ble.channels().disconnected(b).unwrap();
+        assert_eq!((woken(&count_a), woken(&count_b)), (1, 1));
+        assert!(matches!(
+            listen_b.as_mut().poll(&mut Context::from_waker(&waker_b)),
+            Poll::Ready(Err(Error::Disconnected))
+        ));
+        drop((conn_a, conn_b));
     }
 }

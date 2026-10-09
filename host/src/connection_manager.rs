@@ -494,6 +494,25 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
             .unwrap_or(false)
     }
 
+    /// Register `waker` as the one to wake when an L2CAP connection request arrives on `h` (or
+    /// `h` disconnects). Each connection has its own, so listeners on different connections do
+    /// not take each other's place. Returns `false` if `h` is not connected.
+    pub(crate) fn register_l2cap_accept_waker(&self, h: ConnHandle, waker: &core::task::Waker) -> bool {
+        self.with_connected_handle(h, |storage| {
+            storage.l2cap_accept_waker.register(waker);
+            Ok(())
+        })
+        .is_ok()
+    }
+
+    /// Wake the L2CAP listener of connection `h`, if any.
+    pub(crate) fn wake_l2cap_accept(&self, h: ConnHandle) {
+        let _ = self.with_connected_handle(h, |storage| {
+            storage.l2cap_accept_waker.wake();
+            Ok(())
+        });
+    }
+
     pub(crate) fn reassembly<F: FnOnce(&mut PacketReassembly<P::Packet>) -> Result<R, Error>, R>(
         &self,
         h: ConnHandle,
@@ -532,6 +551,8 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
                 #[cfg(feature = "att-queued-writes")]
                 storage.prepare_write.clear();
                 storage.l2cap_listening = false;
+                // a listener waiting on this connection learns it is gone
+                storage.l2cap_accept_waker.wake();
                 return Ok(());
             }
         }
@@ -1261,6 +1282,8 @@ pub struct ConnectionStorage<P> {
     #[cfg(feature = "legacy-pairing")]
     pub encryption_key_len: u8,
     pub l2cap_listening: bool,
+    /// The waker of the L2CAP listener on this connection.
+    pub(crate) l2cap_accept_waker: WakerRegistration,
     pub events: EventChannel,
     pub reassembly: PacketReassembly<P>,
     #[cfg(feature = "gatt")]
@@ -1377,6 +1400,7 @@ impl<P> ConnectionStorage<P> {
             #[cfg(feature = "legacy-pairing")]
             encryption_key_len: 0,
             l2cap_listening: false,
+            l2cap_accept_waker: WakerRegistration::new(),
             events: EventChannel::new(),
             #[cfg(feature = "gatt")]
             gatt: GattChannel::new(),
