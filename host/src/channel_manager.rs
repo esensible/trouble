@@ -883,8 +883,7 @@ impl<'d, P: PacketPool> ChannelManager<'d, P> {
     ) -> Result<(), Error> {
         for storage in self.channels.borrow_mut().iter_mut() {
             if cid == storage.cid {
-                storage.state = ChannelState::PeerDisconnecting(identifier);
-                let _ = storage.inbound.close();
+                storage.peer_disconnecting(identifier);
                 self.state.borrow_mut().disconnect_waker.wake();
                 return Ok(());
             }
@@ -1491,10 +1490,22 @@ impl<P> ChannelStorage<P> {
             let _ = self.inbound.close();
             #[cfg(feature = "channel-metrics")]
             self.metrics.reset();
+            // a sender waiting for credits learns the channel is gone
+            self.credit_waker.wake();
         }
     }
 
+    /// The peer asked to disconnect: no more sending or receiving on the channel.
+    fn peer_disconnecting(&mut self, identifier: u8) {
+        self.state = ChannelState::PeerDisconnecting(identifier);
+        let _ = self.inbound.close();
+        // a sender waiting for credits learns the channel is gone
+        self.credit_waker.wake();
+    }
+
     fn close(&mut self) {
+        // a sender waiting for credits learns the channel is gone
+        self.credit_waker.wake();
         self.state = ChannelState::Disconnected;
         self.cid = 0;
         self.conn = None;
@@ -1682,6 +1693,70 @@ mod tests {
         assert!(matches!(
             chan,
             Poll::Ready(Err(BleHostError::BleHost(Error::Disconnected)))
+        ));
+    }
+
+    /// A sender waiting for credits is woken, and fails, when the peer closes the channel or
+    /// the link drops: it must not wait for credits that will never come.
+    #[test]
+    fn a_sender_waiting_for_credits_learns_the_channel_closed() {
+        let mut resources: HostResources<DefaultPacketPool, 1, 2> = HostResources::new();
+        let ble = MockController::new();
+        let builder = crate::new(ble, &mut resources);
+        let ble = BleHost::new(
+            builder.controller.as_ref().unwrap(),
+            builder.host_state.as_ref().unwrap(),
+        );
+        let conn = ConnHandle::new(5);
+        ble.connections()
+            .connect(
+                conn,
+                Address::new(AddrKind::RANDOM, BdAddr::new([5, 0, 0, 0, 0, 0xc0])),
+                LeConnRole::Peripheral,
+                ConnParams::new(),
+            )
+            .unwrap();
+        let connected = |peer_cid| {
+            ble.channels()
+                .alloc(conn, Some(peer_cid), |s| {
+                    s.state = ChannelState::Connected;
+                    s.peer_credits = 0;
+                    s.peer_mps = 64;
+                    s.peer_mtu = 64;
+                })
+                .unwrap()
+        };
+        let (counter, waker) = counting_waker();
+
+        // the peer sends a Disconnection Request
+        let idx = connected(0x0050);
+        let cid = ble.channels().channel(idx).cid;
+        assert!(ble
+            .channels()
+            .poll_request_to_send(idx, 1, Some(&mut Context::from_waker(&waker)))
+            .is_pending());
+        ble.channels()
+            .handle_disconnect_request(conn, 3, cid, ble.connections())
+            .unwrap();
+        assert_eq!(woken(&counter), 1);
+        assert!(matches!(
+            ble.channels().poll_request_to_send(idx, 1, None),
+            Poll::Ready(Err(Error::NotFound))
+        ));
+        ble.channels().channel_mut(idx).close();
+
+        // the link drops
+        let idx = connected(0x0051);
+        assert!(ble
+            .channels()
+            .poll_request_to_send(idx, 1, Some(&mut Context::from_waker(&waker)))
+            .is_pending());
+        let before = woken(&counter);
+        ble.channels().disconnected(conn).unwrap();
+        assert!(woken(&counter) > before);
+        assert!(matches!(
+            ble.channels().poll_request_to_send(idx, 1, None),
+            Poll::Ready(Err(Error::NotFound))
         ));
     }
 
