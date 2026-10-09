@@ -2375,4 +2375,65 @@ mod tests {
         );
         core::mem::forget(reply);
     }
+
+    /// Regression test: `Characteristic::should_indicate` must read the CCCD's indicate bit.
+    ///
+    /// It asked the server `should_notify`, so a client that enabled indications only (what a
+    /// central does for Service Changed) was reported as not subscribed, and one that enabled
+    /// notifications only as subscribed to indications.
+    #[test]
+    fn test_should_indicate_reads_the_indicate_bit() {
+        use crate::attribute_server::sealed::DynamicAttributeServer;
+
+        let _ = env_logger::try_init();
+
+        const MAX_ATTRIBUTES: usize = 16;
+        const CONNECTIONS_MAX: usize = 3;
+        let mut table: AttributeTable<'_, NoopRawMutex, MAX_ATTRIBUTES> = AttributeTable::new();
+        let mut storage = [0u8; 1];
+        let characteristic: Characteristic<u8> = table
+            .add_service(Service {
+                uuid: Uuid::new_long([0x46; 16]),
+            })
+            .add_characteristic(
+                Uuid::new_long([0x47; 16]),
+                [
+                    CharacteristicProp::Read,
+                    CharacteristicProp::Notify,
+                    CharacteristicProp::Indicate,
+                ],
+                0u8,
+                &mut storage[..],
+            )
+            .build();
+        let cccd = characteristic.cccd_handle.unwrap();
+        let server = AttributeServer::<_, DefaultPacketPool, MAX_ATTRIBUTES, CONNECTIONS_MAX>::new(table);
+
+        let mgr = setup();
+        assert!(mgr.poll_accept(LeConnRole::Peripheral, &[], None).is_pending());
+        unwrap!(mgr.connect(
+            ConnHandle::new(0),
+            Address::new(AddrKind::RANDOM, BdAddr::new(ADDR_1)),
+            LeConnRole::Peripheral,
+            ConnParams::new(),
+        ));
+        let Poll::Ready(conn) = mgr.poll_accept(LeConnRole::Peripheral, &[], None) else {
+            panic!("expected connection to be accepted");
+        };
+        let gatt = conn.clone().with_attribute_server(&server).unwrap();
+        let subscribed = || {
+            (
+                characteristic.should_notify(&gatt),
+                characteristic.should_indicate(&gatt),
+            )
+        };
+
+        assert_eq!(subscribed(), (false, false), "nothing enabled");
+        DynamicAttributeServer::set(&server, &conn, cccd, &[0x02, 0x00]).unwrap();
+        assert_eq!(subscribed(), (false, true), "indications only");
+        DynamicAttributeServer::set(&server, &conn, cccd, &[0x01, 0x00]).unwrap();
+        assert_eq!(subscribed(), (true, false), "notifications only");
+        DynamicAttributeServer::set(&server, &conn, cccd, &[0x03, 0x00]).unwrap();
+        assert_eq!(subscribed(), (true, true), "both");
+    }
 }
