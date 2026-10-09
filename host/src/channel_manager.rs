@@ -159,6 +159,10 @@ impl<'d, P: PacketPool> ChannelManager<'d, P> {
         self.channel(index).peer_mps
     }
 
+    pub(crate) fn peer_credits(&self, index: ChannelIndex) -> u16 {
+        self.channel(index).peer_credits
+    }
+
     pub(crate) fn disconnect(&self, index: ChannelIndex) {
         self.channel_mut(index).disconnect();
         self.state.borrow_mut().disconnect_waker.wake();

@@ -206,6 +206,12 @@ impl<'d, P: PacketPool> L2capChannel<'d, P> {
         self.manager.peer_mps(self.index)
     }
 
+    /// Get the credits the peer has granted and this side has not used yet: how many PDUs can
+    /// be sent before waiting for more.
+    pub fn peer_credits(&self) -> u16 {
+        self.manager.peer_credits(self.index)
+    }
+
     /// Send the provided buffer over this l2cap channel.
     ///
     /// The buffer must be equal to or smaller than the MTU agreed for the channel.
