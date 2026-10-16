@@ -204,6 +204,9 @@ struct Inner {
     finished_waker: WakerRegistration,
     /// Io capabilities
     io_capabilities: IoCapabilities,
+    /// When false, a Pairing Request is answered with Pairing Failed
+    /// (Pairing Not Supported) instead of starting a pairing
+    pairing_allowed: bool,
     /// When true, reject legacy pairing even if the feature is compiled in
     #[cfg(feature = "legacy-pairing")]
     secure_connections_only: bool,
@@ -286,6 +289,15 @@ impl Inner {
             handle,
             peer_identity,
         } = *cmd;
+        // Refused before any pairing state exists: the caller answers with
+        // Pairing Failed (Pairing Not Supported), and the application learns
+        // of it as a `PairingFailed` event on the connection. A bonded peer
+        // is unaffected: resuming encryption is not a Pairing Request.
+        if command == Command::PairingRequest && !self.pairing_allowed {
+            let error = Error::Security(Reason::PairingNotSupported);
+            let _ = storage.events.try_send(ConnectionEvent::PairingFailed(error.clone()));
+            return Err(error);
+        }
         if self.is_idle() && command == Command::PairingRequest {
             let local_address = self.connection_local_address(storage)?;
             let peer_address = Self::connection_peer_address(storage);
@@ -660,6 +672,7 @@ impl<'d> SecurityManager<'d> {
                 pairing_sm: None,
                 finished_waker: WakerRegistration::new(),
                 io_capabilities: IoCapabilities::NoInputNoOutput,
+                pairing_allowed: true,
                 #[cfg(feature = "legacy-pairing")]
                 secure_connections_only: false,
             }),
@@ -671,6 +684,11 @@ impl<'d> SecurityManager<'d> {
     /// Set the IO capabilities
     pub(crate) fn set_io_capabilities(&self, io_capabilities: IoCapabilities) {
         self.inner.borrow_mut().io_capabilities = io_capabilities;
+    }
+
+    /// Allow or refuse pairing requests from peers.
+    pub(crate) fn set_pairing_allowed(&self, allowed: bool) {
+        self.inner.borrow_mut().pairing_allowed = allowed;
     }
 
     /// Enable or disable secure connections only mode.
@@ -1350,9 +1368,59 @@ mod tests {
             )),
             finished_waker: WakerRegistration::new(),
             io_capabilities: IoCapabilities::NoInputNoOutput,
+            pairing_allowed: true,
             #[cfg(feature = "legacy-pairing")]
             secure_connections_only: false,
         }
+    }
+
+    /// A Pairing Request: NoInputNoOutput, OOB absent, bonding + SC, 16-byte
+    /// key, no keys distributed.
+    const PAIRING_REQUEST: [u8; 6] = [0x03, 0x00, 0x09, 16, 0x00, 0x00];
+
+    fn pairing_request(inner: &mut Inner, allowed: bool, last: u8) -> (Result<(), Error>, bool) {
+        let mgr = setup_manager();
+        let handle = ConnHandle::new(5);
+        let current = Identity::from(Address::random([last, 2, 3, 4, 5, 6]));
+        unwrap!(mgr.connect(handle, current.addr, LeConnRole::Peripheral, ConnParams::new()));
+        inner.pairing_sm = None;
+        inner.pairing_allowed = allowed;
+        let mut bonds: heapless::Vec<BondInformation, 4> = heapless::Vec::new();
+        let events = Channel::<NoopRawMutex, SecurityEventData, 3>::new();
+        let mut out = (Ok(()), false);
+        unwrap!(mgr.with_connected_handle(handle, |storage| {
+            let cmd = SmpCommand {
+                command: Command::PairingRequest,
+                payload: &PAIRING_REQUEST,
+                handle,
+                peer_identity: storage.peer_identity,
+            };
+            out.0 = inner.handle_peripheral(&mut bonds, &events, &cmd, mgr, storage);
+            out.1 = matches!(
+                storage.events.try_receive(),
+                Ok(ConnectionEvent::PairingFailed(Error::Security(Reason::PairingNotSupported)))
+            );
+            Ok(())
+        }));
+        out
+    }
+
+    #[test]
+    fn pairing_request_refused_while_pairing_is_not_allowed() {
+        let mut inner = test_inner(Address::random([0x43, 2, 3, 4, 5, 6]));
+        let (result, reported) = pairing_request(&mut inner, false, 0x13);
+        assert_eq!(result, Err(Error::Security(Reason::PairingNotSupported)));
+        assert!(reported);
+        assert!(inner.pairing_sm.is_none());
+    }
+
+    #[test]
+    fn pairing_request_starts_a_pairing_while_pairing_is_allowed() {
+        let mut inner = test_inner(Address::random([0x44, 2, 3, 4, 5, 6]));
+        let (result, reported) = pairing_request(&mut inner, true, 0x14);
+        assert_eq!(result, Ok(()));
+        assert!(!reported);
+        assert!(inner.pairing_sm.is_some());
     }
 
     #[test]

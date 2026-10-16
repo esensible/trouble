@@ -918,6 +918,28 @@ impl<'stack, C: Controller, P: PacketPool> Stack<'stack, C, P> {
             .set_io_capabilities(io_capabilities);
     }
 
+    /// Allow or refuse pairing (allowed by default).
+    ///
+    /// While refused, the security manager answers a peer's Pairing Request
+    /// with Pairing Failed, reason Pairing Not Supported, and reports
+    /// [`ConnectionEvent::PairingFailed`](crate::connection::ConnectionEvent::PairingFailed)
+    /// with that reason on the connection;
+    /// no pairing starts, so no keys are exchanged and neither side stores a
+    /// bond. A peer already bonded is unaffected: it resumes encryption with
+    /// its key, which is not a pairing. This is how a device that pairs only
+    /// in a user-opened window says so (Core Vol 3 Part H 3.5.5): a pairing
+    /// that ran without bonding would still leave the peer believing it is
+    /// paired.
+    ///
+    /// Only relevant if the feature `security` is enabled.
+    #[cfg(feature = "security")]
+    pub fn set_pairing_allowed(&self, allowed: bool) {
+        self.host_state
+            .connections
+            .security_manager
+            .set_pairing_allowed(allowed);
+    }
+
     /// Enable or disable secure connections only mode.
     ///
     /// When enabled, legacy pairing is rejected even if the `legacy-pairing` feature is compiled in.
