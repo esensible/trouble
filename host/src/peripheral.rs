@@ -375,3 +375,167 @@ impl<C, P: PacketPool> Drop for Advertiser<'_, C, P> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use core::future::Future;
+    use core::pin::pin;
+    use core::task::{Context, Waker};
+
+    use bt_hci::param::{ConnHandle, Status};
+
+    use super::*;
+    #[cfg(feature = "security")]
+    use crate::connection_manager::ResolvablePrivateAddrs;
+    use crate::mock_controller::MockController;
+    use crate::prelude::{ConnParams, DefaultPacketPool};
+    use crate::HostResources;
+
+    type Host<'d> = BleHost<'d, MockController, DefaultPacketPool>;
+
+    /// What `Peripheral::advertise` leaves behind for one legacy advertising
+    /// set, once the controller has accepted `LeSetAdvEnable`.
+    fn advertising<'d>(host: Host<'d>) -> Advertiser<'d, MockController, DefaultPacketPool> {
+        embassy_futures::block_on(host.advertise_command_state().request(false));
+        host.advertise_state().reset();
+        host.advertise_state().start(&[AdvSet {
+            adv_handle: AdvHandle::new(0),
+            duration: bt_hci_duration(embassy_time::Duration::from_micros(0)),
+            max_ext_adv_events: 0,
+        }]);
+        Advertiser {
+            host,
+            extended: false,
+            done: false,
+        }
+    }
+
+    fn connection_complete(host: Host<'_>, status: u8, handle: u16, role: LeConnRole) -> bool {
+        host.handle_connection(
+            Status::new(status),
+            ConnHandle::new(handle),
+            Address::new(AddrKind::RANDOM, BdAddr::new([1, 2, 3, 4, 5, 0xc0])),
+            role,
+            ConnParams::new(),
+            #[cfg(feature = "security")]
+            ResolvablePrivateAddrs::none(),
+        )
+    }
+
+    fn poll<F: Future>(f: core::pin::Pin<&mut F>) -> Poll<F::Output> {
+        f.poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    /// 0x3E Connection Failed to be Established: the controller stopped legacy
+    /// advertising when it took the CONNECT_IND, so `accept` must end (it used to
+    /// wait forever, and the application never advertised again).
+    #[test]
+    fn a_failed_peripheral_connection_ends_accept() {
+        let mut resources: HostResources<DefaultPacketPool, 2, 2> = HostResources::new();
+        let builder = crate::new(MockController::new(), &mut resources);
+        let host = BleHost::new(
+            builder.controller.as_ref().unwrap(),
+            builder.host_state.as_ref().unwrap(),
+        );
+        let mut accept = pin!(advertising(host).accept());
+        assert!(poll(accept.as_mut()).is_pending());
+        assert!(connection_complete(host, 0x3E, 1, LeConnRole::Peripheral));
+        assert!(matches!(poll(accept.as_mut()), Poll::Ready(Err(Error::Timeout))));
+        // The advertise command is over: a new `advertise` may start.
+        assert!(host.advertise_command_state().is_idle());
+    }
+
+    /// A failure whose role names the central, while no central connect is
+    /// pending, can only be the advertiser's.
+    #[test]
+    fn a_failed_connection_with_no_connect_pending_ends_accept() {
+        let mut resources: HostResources<DefaultPacketPool, 2, 2> = HostResources::new();
+        let builder = crate::new(MockController::new(), &mut resources);
+        let host = BleHost::new(
+            builder.controller.as_ref().unwrap(),
+            builder.host_state.as_ref().unwrap(),
+        );
+        let mut accept = pin!(advertising(host).accept());
+        assert!(poll(accept.as_mut()).is_pending());
+        assert!(connection_complete(host, 0x40, 0, LeConnRole::Central));
+        assert!(matches!(poll(accept.as_mut()), Poll::Ready(Err(Error::Timeout))));
+    }
+
+    /// A failed central connect while advertising ends the connect, not the
+    /// advertiser.
+    #[test]
+    fn a_failed_central_connect_leaves_the_advertiser() {
+        let mut resources: HostResources<DefaultPacketPool, 2, 2> = HostResources::new();
+        let builder = crate::new(MockController::new(), &mut resources);
+        let host = BleHost::new(
+            builder.controller.as_ref().unwrap(),
+            builder.host_state.as_ref().unwrap(),
+        );
+        let mut accept = pin!(advertising(host).accept());
+        embassy_futures::block_on(host.connect_command_state().request(true));
+        assert!(poll(accept.as_mut()).is_pending());
+        assert!(connection_complete(host, 0x3E, 0, LeConnRole::Central));
+        assert!(host.connect_command_state().is_idle());
+        assert!(poll(accept.as_mut()).is_pending());
+    }
+
+    /// A connection the controller created and dropped before `accept` ever
+    /// polled it: no accept will take it, so `accept` must end.
+    #[test]
+    fn an_unaccepted_connection_that_drops_ends_accept() {
+        let mut resources: HostResources<DefaultPacketPool, 2, 2> = HostResources::new();
+        let builder = crate::new(MockController::new(), &mut resources);
+        let host = BleHost::new(
+            builder.controller.as_ref().unwrap(),
+            builder.host_state.as_ref().unwrap(),
+        );
+        let mut accept = pin!(advertising(host).accept());
+        assert!(poll(accept.as_mut()).is_pending());
+        assert!(connection_complete(host, 0x00, 7, LeConnRole::Peripheral));
+        host.handle_disconnection(ConnHandle::new(7), Status::new(0x3E));
+        assert!(matches!(poll(accept.as_mut()), Poll::Ready(Err(Error::Timeout))));
+    }
+
+    /// The normal path is unchanged: a connection is accepted, and a later
+    /// disconnect of an accepted connection touches no advertiser.
+    #[test]
+    fn a_connection_is_accepted_and_its_disconnect_leaves_the_next_advertiser() {
+        let mut resources: HostResources<DefaultPacketPool, 2, 2> = HostResources::new();
+        let builder = crate::new(MockController::new(), &mut resources);
+        let host = BleHost::new(
+            builder.controller.as_ref().unwrap(),
+            builder.host_state.as_ref().unwrap(),
+        );
+        let conn = {
+            let mut accept = pin!(advertising(host).accept());
+            assert!(poll(accept.as_mut()).is_pending());
+            assert!(connection_complete(host, 0x00, 7, LeConnRole::Peripheral));
+            match poll(accept.as_mut()) {
+                Poll::Ready(Ok(conn)) => conn,
+                _ => panic!("connection not accepted"),
+            }
+        };
+        let mut accept = pin!(advertising(host).accept());
+        assert!(poll(accept.as_mut()).is_pending());
+        host.handle_disconnection(ConnHandle::new(7), Status::new(0x13));
+        assert!(poll(accept.as_mut()).is_pending());
+        drop(conn);
+    }
+
+    /// A failed connection complete while nothing advertises or connects (one
+    /// was seen at boot, before advertising) changes nothing.
+    #[test]
+    fn a_failed_connection_with_no_one_waiting_is_only_logged() {
+        let mut resources: HostResources<DefaultPacketPool, 2, 2> = HostResources::new();
+        let builder = crate::new(MockController::new(), &mut resources);
+        let host = BleHost::new(
+            builder.controller.as_ref().unwrap(),
+            builder.host_state.as_ref().unwrap(),
+        );
+        assert!(connection_complete(host, 0x40, 0, LeConnRole::Central));
+        assert!(host.advertise_command_state().is_idle());
+        assert!(host.connect_command_state().is_idle());
+    }
+}

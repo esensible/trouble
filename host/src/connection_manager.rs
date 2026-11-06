@@ -521,9 +521,15 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
         self.with_connected_handle(h, |storage| f(&mut storage.reassembly))
     }
 
-    pub(crate) fn disconnected(&self, h: ConnHandle, reason: Status) -> Result<(), Error> {
+    /// Mark the connection with handle `h` disconnected.
+    ///
+    /// Returns the connection's role when it was never accepted (still
+    /// `Connecting`): nobody will ever accept it now, so whoever was waiting
+    /// to (an advertiser, a connect) must be told some other way.
+    pub(crate) fn disconnected(&self, h: ConnHandle, reason: Status) -> Result<Option<LeConnRole>, Error> {
         for (idx, storage) in self.connections.borrow_mut().iter_mut().enumerate() {
             if h == storage.handle && storage.state != ConnectionState::Disconnected {
+                let unaccepted = (storage.state == ConnectionState::Connecting).then_some(storage.role);
                 storage.state = ConnectionState::Disconnected;
                 storage.reassembly.clear();
                 storage.acl_send_locked = false;
@@ -553,7 +559,7 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
                 storage.l2cap_listening = false;
                 // a listener waiting on this connection learns it is gone
                 storage.l2cap_accept_waker.wake();
-                return Ok(());
+                return Ok(unaccepted);
             }
         }
         warn!("[link][disconnect] connection handle {:?} not found", h);

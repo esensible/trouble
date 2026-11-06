@@ -102,7 +102,6 @@ impl<CTX: Clone + Copy> CommandState<CTX> {
     }
 
     /// Check whether an active or canceling command's context matches a predicate.
-    #[cfg(all(feature = "security", feature = "central"))]
     pub fn is_active_with(&self, predicate: impl Fn(CTX) -> bool) -> bool {
         self.with_inner(|inner| match inner.state {
             State::Active(ctx) | State::Cancel(ctx) => predicate(ctx),

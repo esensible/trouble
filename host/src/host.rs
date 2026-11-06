@@ -645,7 +645,7 @@ where
         self.controller.write_iso_data(packet).await
     }
 
-    fn handle_connection(
+    pub(crate) fn handle_connection(
         &self,
         status: Status,
         handle: ConnHandle,
@@ -665,6 +665,11 @@ where
                     resolvable_addrs,
                 ) {
                     warn!("Error establishing connection: {:?}", err);
+                    if role == LeConnRole::Peripheral {
+                        // The controller created it, so it has stopped advertising,
+                        // but no accept will ever see it (it is disconnected instead).
+                        self.end_legacy_advertising();
+                    }
                     return false;
                 } else {
                     #[cfg(feature = "defmt")]
@@ -690,11 +695,61 @@ where
                 self.state.connect_command_state.canceled();
             }
             Err(e) => {
-                warn!("Error connection complete event: {:?}", e);
-                self.state.connect_command_state.canceled();
+                // A connection that failed to be established (e.g. 0x3E, the central
+                // never sent the first packet after its CONNECT_IND). Legacy advertising
+                // ended when the controller took the CONNECT_IND (Core Vol 4 Part E
+                // 7.8.9: advertising continues "until a connection is created"), so an
+                // advertiser waiting in `accept` would otherwise wait forever: no
+                // connection to accept, and no Advertising Set Terminated for legacy
+                // advertising. Whose failure it is goes by the role, and when the role
+                // names no one waiting, by who is waiting.
+                let advertising = self.legacy_advertising();
+                let connecting = !self.state.connect_command_state.is_idle();
+                let peripheral = role == LeConnRole::Peripheral;
+                warn!(
+                    "Error connection complete event: {:?} (role {}, advertising {}, connecting {})",
+                    e,
+                    if peripheral { "peripheral" } else { "central" },
+                    advertising,
+                    connecting
+                );
+                if advertising && (peripheral || !connecting) {
+                    self.end_legacy_advertising();
+                } else if connecting {
+                    self.state.connect_command_state.canceled();
+                }
             }
         }
         true
+    }
+
+    /// Whether a legacy advertising command is in progress (an `Advertiser` from
+    /// `Peripheral::advertise` is alive).
+    fn legacy_advertising(&self) -> bool {
+        self.state.advertise_command_state.is_active_with(|extended| !extended)
+    }
+
+    /// The controller has stopped legacy advertising for a connection the advertiser
+    /// will never accept: end the advertise state so its `accept` returns
+    /// `Error::Timeout` and the application can advertise again.
+    fn end_legacy_advertising(&self) {
+        if self.legacy_advertising() {
+            self.state.advertise_state.reset();
+        }
+    }
+
+    /// An HCI Disconnection Complete for `handle`.
+    pub(crate) fn handle_disconnection(&self, handle: ConnHandle, reason: Status) {
+        if let Ok(Some(LeConnRole::Peripheral)) = self.state.connections.disconnected(handle, reason) {
+            // Gone before any accept took it: the advertiser that the controller
+            // stopped for it would otherwise wait forever.
+            warn!(
+                "[host] peripheral connection {} disconnected before it was accepted",
+                handle.raw()
+            );
+            self.end_legacy_advertising();
+        }
+        let _ = self.state.channels.disconnected(handle);
     }
 
     fn handle_acl(&self, acl: AclPacket<'_>, event_handler: &dyn EventHandler) -> Result<(), Error> {
@@ -1617,8 +1672,7 @@ impl<'d, C: Controller, P: PacketPool> RxRunner<'d, C, P> {
                                 None
                             }
                             .unwrap_or(Status::UNSPECIFIED);
-                            let _ = host.state.connections.disconnected(handle, reason);
-                            let _ = host.state.channels.disconnected(handle);
+                            host.handle_disconnection(handle, reason);
                             let mut m = host.state.metrics.borrow_mut();
                             m.disconnect_events = m.disconnect_events.wrapping_add(1);
                         }

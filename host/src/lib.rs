@@ -27,6 +27,9 @@ pub use crate::security_manager::{
     BondInformation, IdentityResolvingKey, LongTermKey, OobData, Reason as PairingFailedReason,
 };
 pub use crate::types::capabilities::IoCapabilities;
+/// The HCI crate this host is built on, for `Stack::command` with commands
+/// (and their parameter types) of the same version.
+pub use bt_hci;
 
 mod fmt;
 
